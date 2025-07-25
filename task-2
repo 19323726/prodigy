@@ -1,0 +1,33 @@
+# text_to_image.py
+
+import torch
+from diffusers import StableDiffusionPipeline
+from PIL import Image
+
+def generate_image(prompt: str,
+                   model_name: str = "stabilityai/stable-diffusion-2-1",
+                   guidance_scale: float = 7.5,
+                   num_inference_steps: int = 50,
+                   device: str = "cuda"):
+    """
+    Generate an image from text prompt using Stable Diffusion.
+    """
+    # Load the pipeline
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+    )
+    pipe = pipe.to(device)
+
+    # Run generation
+    result = pipe(prompt=prompt,
+                  guidance_scale=guidance_scale,
+                  num_inference_steps=num_inference_steps)
+    image = result.images[0]
+    return image
+
+if __name__ == "__main__":
+    prompt = "A serene landscape at sunrise, photorealistic"
+    img = generate_image(prompt)
+    img.show()       # display
+    img.save("output.png")
