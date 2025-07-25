@@ -1,0 +1,246 @@
+import tensorflow as tf
+from tensorflow.keras import layers
+import numpy as np
+import os
+import time
+
+# --- Hyperparameters ---
+IMG_WIDTH = 256
+IMG_HEIGHT = 256
+BATCH_SIZE = 1
+BUFFER_SIZE = 400 # For shuffling
+LAMBDA = 100 # Weight for L1 loss
+EPOCHS = 150 # Or more, depending on dataset size and convergence
+
+# --- Data Loading and Preprocessing ---
+# You would typically load paired images (input_image, target_image)
+# Example: Using the Facades dataset (available on TensorFlow Datasets)
+# dataset = tfds.load('facades', split='train', as_supervised=True)
+# Or manually load images from a directory
+def load_image(image_path):
+    # This is a simplified placeholder.
+    # In a real scenario, you'd load two images: input_image and target_image
+    # e.g., for Facades, the original image is input_image | target_image
+    image = tf.io.read_file(image_path)
+    image = tf.image.decode_jpeg(image)
+    image = tf.cast(image, tf.float32)
+
+    # Assume target and input are side-by-side in a single image
+    w = tf.shape(image)[1]
+    w = w // 2
+    input_image = image[:, w:, :] # Right half for Facades
+    real_image = image[:, :w, :]  # Left half for Facades
+
+    # Resize and normalize
+    input_image = tf.image.resize(input_image, [IMG_HEIGHT, IMG_WIDTH])
+    real_image = tf.image.resize(real_image, [IMG_HEIGHT, IMG_WIDTH])
+
+    # Normalize images to [-1, 1]
+    input_image = (input_image / 127.5) - 1
+    real_image = (real_image / 127.5) - 1
+    return input_image, real_image
+
+# Assume you have a list of image paths (e.g., 'path/to/facades_train/*.jpg')
+# train_dataset = tf.data.Dataset.list_files('/path/to/facades_train/*.jpg')
+# train_dataset = train_dataset.map(load_image, num_parallel_calls=tf.data.AUTOTUNE)
+# train_dataset = train_dataset.shuffle(BUFFER_SIZE).batch(BATCH_SIZE)
+
+# For demonstration, let's create dummy data
+def generate_dummy_data():
+    input_img = tf.random.normal([IMG_HEIGHT, IMG_WIDTH, 3])
+    target_img = tf.random.normal([IMG_HEIGHT, IMG_WIDTH, 3])
+    return input_img, target_img
+
+train_dataset = tf.data.Dataset.from_generator(
+    generate_dummy_data,
+    output_types=(tf.float32, tf.float32),
+    output_shapes=((IMG_HEIGHT, IMG_WIDTH, 3), (IMG_HEIGHT, IMG_WIDTH, 3))
+).repeat().batch(BATCH_SIZE)
+
+
+# --- Generator (U-Net) ---
+def downsample(filters, size, apply_batchnorm=True):
+    initializer = tf.random_normal_initializer(0., 0.02)
+    result = tf.keras.Sequential()
+    result.add(layers.Conv2D(filters, size, strides=2, padding='same',
+                             kernel_initializer=initializer, use_bias=False))
+    if apply_batchnorm:
+        result.add(layers.BatchNormalization())
+    result.add(layers.LeakyReLU())
+    return result
+
+def upsample(filters, size, apply_dropout=False):
+    initializer = tf.random_normal_initializer(0., 0.02)
+    result = tf.keras.Sequential()
+    result.add(layers.Conv2DTranspose(filters, size, strides=2,
+                                       padding='same', kernel_initializer=initializer,
+                                       use_bias=False))
+    result.add(layers.BatchNormalization())
+    if apply_dropout:
+        result.add(layers.Dropout(0.5))
+    result.add(layers.ReLU())
+    return result
+
+def Generator():
+    inputs = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3])
+
+    down_stack = [
+        downsample(64, 4, apply_batchnorm=False), # (bs, 128, 128, 64)
+        downsample(128, 4), # (bs, 64, 64, 128)
+        downsample(256, 4), # (bs, 32, 32, 256)
+        downsample(512, 4), # (bs, 16, 16, 512)
+        downsample(512, 4), # (bs, 8, 8, 512)
+        downsample(512, 4), # (bs, 4, 4, 512)
+        downsample(512, 4), # (bs, 2, 2, 512)
+        downsample(512, 4), # (bs, 1, 1, 512)
+    ]
+
+    up_stack = [
+        upsample(512, 4, apply_dropout=True), # (bs, 2, 2, 1024)
+        upsample(512, 4, apply_dropout=True), # (bs, 4, 4, 1024)
+        upsample(512, 4, apply_dropout=True), # (bs, 8, 8, 1024)
+        upsample(512, 4), # (bs, 16, 16, 1024)
+        upsample(256, 4), # (bs, 32, 32, 512)
+        upsample(128, 4), # (bs, 64, 64, 256)
+        upsample(64, 4), # (bs, 128, 128, 128)
+    ]
+
+    initializer = tf.random_normal_initializer(0., 0.02)
+    last = layers.Conv2DTranspose(3, 4, strides=2,
+                                  padding='same', kernel_initializer=initializer,
+                                  activation='tanh') # (bs, 256, 256, 3)
+
+    x = inputs
+    skips = []
+    for down in down_stack:
+        x = down(x)
+        skips.append(x)
+
+    skips = reversed(skips[:-1]) # Don't take the last skip as it's the bottleneck output
+
+    # Upsampling and establishing the skip connections
+    for up, skip in zip(up_stack, skips):
+        x = up(x)
+        x = layers.Concatenate()([x, skip]) # Skip connection
+
+    x = last(x)
+
+    return tf.keras.Model(inputs=inputs, outputs=x)
+
+# --- Discriminator (PatchGAN) ---
+def Discriminator():
+    initializer = tf.random_normal_initializer(0., 0.02)
+
+    inp = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], name='input_image')
+    tar = layers.Input(shape=[IMG_HEIGHT, IMG_WIDTH, 3], name='target_image')
+
+    x = layers.concatenate([inp, tar]) # (bs, 256, 256, channels*2)
+
+    down1 = downsample(64, 4, False)(x) # (bs, 128, 128, 64)
+    down2 = downsample(128, 4)(down1) # (bs, 64, 64, 128)
+    down3 = downsample(256, 4)(down2) # (bs, 32, 32, 256)
+
+    zero_pad1 = layers.ZeroPadding2D()(down3) # (bs, 34, 34, 256)
+    conv = layers.Conv2D(512, 4, strides=1, kernel_initializer=initializer,
+                         use_bias=False)(zero_pad1) # (bs, 31, 31, 512)
+
+    batchnorm1 = layers.BatchNormalization()(conv)
+    leaky_relu = layers.LeakyReLU()(batchnorm1)
+
+    zero_pad2 = layers.ZeroPadding2D()(leaky_relu) # (bs, 33, 33, 512)
+
+    last = layers.Conv2D(1, 4, strides=1,
+                         kernel_initializer=initializer)(zero_pad2) # (bs, 30, 30, 1)
+
+    return tf.keras.Model(inputs=[inp, tar], outputs=last)
+
+
+# --- Define Models and Optimizers ---
+generator = Generator()
+discriminator = Discriminator()
+
+# Use BinaryCrossentropy for Discriminator and Generator adversarial loss
+loss_object = tf.keras.losses.BinaryCrossentropy(from_logits=True)
+
+def discriminator_loss(disc_real_output, disc_generated_output):
+    real_loss = loss_object(tf.ones_like(disc_real_output), disc_real_output)
+    generated_loss = loss_object(tf.zeros_like(disc_generated_output), disc_generated_output)
+    total_disc_loss = real_loss + generated_loss
+    return total_disc_loss
+
+def generator_loss(disc_generated_output, gen_output, target):
+    gan_loss = loss_object(tf.ones_like(disc_generated_output), disc_generated_output)
+    # L1 loss
+    l1_loss = tf.reduce_mean(tf.abs(target - gen_output))
+    total_gen_loss = gan_loss + (LAMBDA * l1_loss)
+    return total_gen_loss
+
+generator_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+discriminator_optimizer = tf.keras.optimizers.Adam(2e-4, beta_1=0.5)
+
+# --- Checkpoint Management (Optional but Recommended) ---
+checkpoint_dir = './training_checkpoints'
+checkpoint_prefix = os.path.join(checkpoint_dir, "ckpt")
+checkpoint = tf.train.Checkpoint(generator_optimizer=generator_optimizer,
+                                 discriminator_optimizer=discriminator_optimizer,
+                                 generator=generator,
+                                 discriminator=discriminator)
+
+
+# --- Training Step ---
+@tf.function
+def train_step(input_image, target, epoch):
+    with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+        gen_output = generator(input_image, training=True)
+
+        disc_real_output = discriminator([input_image, target], training=True)
+        disc_generated_output = discriminator([input_image, gen_output], training=True)
+
+        gen_total_loss = generator_loss(disc_generated_output, gen_output, target)
+        disc_loss = discriminator_loss(disc_real_output, disc_generated_output)
+
+    generator_gradients = gen_tape.gradient(gen_total_loss, generator.trainable_variables)
+    discriminator_gradients = disc_tape.gradient(disc_loss, discriminator.trainable_variables)
+
+    generator_optimizer.apply_gradients(zip(generator_gradients, generator.trainable_variables))
+    discriminator_optimizer.apply_gradients(zip(discriminator_gradients, discriminator.trainable_variables))
+
+    return gen_total_loss, disc_loss, gen_output
+
+# --- Training Loop ---
+def fit(dataset, epochs):
+    for epoch in range(epochs):
+        start = time.time()
+
+        for n, (input_image, target) in enumerate(dataset.take(100)): # Process 100 batches for demo
+            gen_total_loss, disc_loss, _ = train_step(input_image, target, epoch)
+            if n % 10 == 0:
+                print(f'Epoch {epoch+1}, Batch {n}: Gen Loss {gen_total_loss:.4f}, Disc Loss {disc_loss:.4f}')
+
+        # Save the model every X epochs (or based on some metric)
+        if (epoch + 1) % 20 == 0:
+            checkpoint.save(file_prefix=checkpoint_prefix)
+
+        print(f'Time taken for epoch {epoch+1} is {time.time()-start:.2f} sec\n')
+
+# --- Run Training (Dummy Data) ---
+print("Starting training with dummy data...")
+fit(train_dataset, EPOCHS)
+print("Training complete!")
+
+# --- Generate Example Images (after training) ---
+# To actually see meaningful results, you need to train on a real dataset
+# and then load the best checkpoint.
+# checkpoint.restore(tf.train.latest_checkpoint(checkpoint_dir))
+
+# def generate_images(model, test_input, tar):
+#     prediction = model(test_input, training=True)
+#     # You'd typically save or display these images here
+#     # For now, just print shape
+#     print(f"Generated image shape: {prediction.shape}")
+
+# # Example inference on a single dummy image
+# test_input_dummy, target_dummy = generate_dummy_data()
+# test_input_dummy = tf.expand_dims(test_input_dummy, 0)
+# target_dummy = tf.expand_dims(target_dummy, 0)
+# generate_images(generator, test_input_dummy, target_dummy)
