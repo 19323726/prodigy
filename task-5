@@ -1,0 +1,207 @@
+import tensorflow as tf
+import tensorflow_hub as hub # Used if you prefer a pre-trained model from TF Hub
+import numpy as np
+import PIL.Image
+import time
+import functools
+
+# --- 0. Helper Functions for Image Loading and Display ---
+
+def load_img(path_to_img):
+    max_dim = 512
+    img = tf.io.read_file(path_to_img)
+    img = tf.image.decode_image(img, channels=3)
+    img = tf.image.convert_image_dtype(img, tf.float32) # Normalize to [0, 1]
+
+    shape = tf.cast(tf.shape(img)[:-1], tf.float32)
+    long_dim = max(shape)
+    scale = max_dim / long_dim
+
+    new_shape = tf.cast(shape * scale, tf.int32)
+
+    img = tf.image.resize(img, new_shape)
+    img = img[tf.newaxis, :] # Add batch dimension
+    return img
+
+def imshow(image, title=None):
+    if len(image.shape) > 3:
+        image = tf.squeeze(image, axis=0) # Remove batch dimension
+
+    # Convert back to [0, 255] for PIL display
+    image = image * 255
+    image = tf.clip_by_value(image, 0, 255)
+    image = tf.cast(image, tf.uint8)
+
+    # Convert to PIL Image and display (requires matplotlib or similar for actual display)
+    # For a real application, you'd use matplotlib.pyplot.imshow
+    # import matplotlib.pyplot as plt
+    # plt.imshow(image.numpy())
+    # if title:
+    #     plt.title(title)
+    # plt.show()
+    return PIL.Image.fromarray(image.numpy())
+
+
+# --- 1. Load VGG19 and Define Layers ---
+
+# Content layer where content loss is calculated
+content_layers = ['block5_conv2']
+
+# Style layers where style loss is calculated
+style_layers = ['block1_conv1',
+                'block2_conv1',
+                'block3_conv1',
+                'block4_conv1',
+                'block5_conv1']
+
+def vgg_layers(layer_names):
+    """Creates a VGG model that returns a list of intermediate output values."""
+    # Load our pre-trained VGG19 model without the classification head
+    vgg = tf.keras.applications.VGG19(include_top=False, weights='imagenet')
+    vgg.trainable = False # Freeze VGG weights
+
+    outputs = [vgg.get_layer(name).output for name in layer_names]
+    model = tf.keras.Model([vgg.input], outputs)
+    return model
+
+# Create instances of the feature extraction models
+content_extractor = vgg_layers(content_layers)
+style_extractor = vgg_layers(style_layers)
+
+# --- 2. Define Loss Functions ---
+
+# Function to compute Gram Matrix
+def gram_matrix(input_tensor):
+    result = tf.linalg.einsum('bijc,bijd->bcd', input_tensor, input_tensor)
+    input_shape = tf.shape(input_tensor)
+    num_locations = tf.cast(input_shape[1]*input_shape[2], tf.float32)
+    return result / num_locations
+
+# Class to encapsulate the style and content extraction
+class StyleContentModel(tf.keras.models.Model):
+    def __init__(self, style_layers, content_layers):
+        super(StyleContentModel, self).__init__()
+        self.vgg = vgg_layers(style_layers + content_layers)
+        self.style_layers = style_layers
+        self.content_layers = content_layers
+        self.num_style_layers = len(style_layers)
+        self.vgg.trainable = False
+
+    def call(self, inputs):
+        # Expects input in [0, 1] range, convert to VGG's expected input
+        inputs = inputs * 255.0
+        # Normalization steps as done in VGG original paper
+        # Mean pixel values for ImageNet (RGB)
+        # Using tf.keras.applications.vgg19.preprocess_input is more robust
+        preprocessed_input = tf.keras.applications.vgg19.preprocess_input(inputs)
+
+        outputs = self.vgg(preprocessed_input)
+        style_outputs, content_outputs = (outputs[:self.num_style_layers],
+                                          outputs[self.num_style_layers:])
+
+        style_features = [gram_matrix(style_output)
+                          for style_output in style_outputs]
+
+        return {'content': content_outputs, 'style': style_features}
+
+
+# --- 3. Setup and Optimization ---
+
+# Weights for the different loss components
+style_weight=1e-2 # Adjust based on desired style strength
+content_weight=1e4 # Adjust based on desired content strength
+total_variation_weight=30 # Adjust for smoothness
+
+# Optimizer
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.02, beta_1=0.99, epsilon=1e-1)
+
+
+@tf.function()
+def train_step(image):
+    with tf.GradientTape() as tape:
+        model_outputs = extractor(image)
+        style_outputs = model_outputs['style']
+        content_outputs = model_outputs['content']
+
+        style_loss = tf.add_n([tf.reduce_mean((style_outputs[name] - style_targets[name])**2)
+                               for name in style_outputs.keys()])
+        style_loss *= style_weight / num_style_layers
+
+        content_loss = tf.add_n([tf.reduce_mean((content_outputs[name] - content_targets[name])**2)
+                                 for name in content_outputs.keys()])
+        content_loss *= content_weight / num_content_layers
+
+        # Total variation loss
+        # Use tf.image.total_variation directly for simplicity and robustness
+        tv_loss = tf.image.total_variation(image)
+        tv_loss *= total_variation_weight
+
+        total_loss = style_loss + content_loss + tv_loss
+
+    grad = tape.gradient(total_loss, image)
+    optimizer.apply_gradients([(grad, image)])
+    # Ensure pixel values stay in [0, 1] range
+    image.assign(tf.clip_by_value(image, 0, 1))
+
+    return total_loss, style_loss, content_loss, tv_loss
+
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    # --- Load Content and Style Images ---
+    # You need to provide paths to your images
+    # Example images (replace with your own paths)
+    content_path = tf.keras.utils.get_file('turtle.jpg','https://storage.googleapis.com/download.tensorflow.org/example_images/Green_Sea_Turtle_clip.jpg')
+    style_path = tf.keras.utils.get_file('kandinsky.jpg','https://storage.googleapis.com/download.tensorflow.org/example_images/Vassily_Kandinsky%2C_1913._Composition_7.jpg')
+
+    content_image = load_img(content_path)
+    style_image = load_img(style_path)
+
+    # Display loaded images (optional)
+    print("Content Image:")
+    imshow(content_image).save("content_image.jpg") # Save for verification
+    print("Style Image:")
+    imshow(style_image).save("style_image.jpg") # Save for verification
+
+    # --- Setup Model for Loss Calculation ---
+    extractor = StyleContentModel(style_layers, content_layers)
+
+    # Get target features from original images
+    style_targets = extractor(style_image)['style']
+    content_targets = extractor(content_image)['content']
+
+    num_content_layers = len(content_layers)
+    num_style_layers = len(style_layers)
+
+    # Initialize the image to be optimized (start with content image)
+    # tf.Variable makes the tensor trainable/mutable
+    image = tf.Variable(content_image)
+
+    # --- Run Optimization ---
+    epochs = 10
+    steps_per_epoch = 100
+
+    print("Starting neural style transfer...")
+    start = time.time()
+
+    for i in range(epochs):
+        for j in range(steps_per_epoch):
+            total_loss, style_l, content_l, tv_l = train_step(image)
+            if j % 10 == 0:
+                print(f"Epoch {i+1}/{epochs}, Step {j+1}/{steps_per_epoch} - "
+                      f"Total Loss: {total_loss:.4f}, Style: {style_l:.4f}, "
+                      f"Content: {content_l:.4f}, TV: {tv_l:.4f}")
+
+        # You can save/display intermediate results here
+        # imshow(image, title=f"Epoch {i+1} Result").save(f"transfer_epoch_{i+1}.jpg")
+        print(f"Epoch {i+1} finished.")
+
+
+    end = time.time()
+    print(f"\nTotal time: {end - start:.2f}s")
+
+    # --- Final Result ---
+    print("\nFinal Result:")
+    final_image_pil = imshow(image, title="Style Transfer Result")
+    final_image_pil.save("style_transfer_result.jpg")
+    print("Final image saved as style_transfer_result.jpg")
