@@ -1,0 +1,157 @@
+pip install transformers datasets torch
+
+from transformers import pipeline
+
+# 1. Load the fine-tuned model and tokenizer
+model_path = "./fine-tuned-gpt2-model"
+fine_tuned_tokenizer = AutoTokenizer.from_pretrained(model_path)
+fine_tuned_model = GPT2LMHeadModel.from_pretrained(model_path)
+
+# Ensure padding token is set for the tokenizer
+fine_tuned_tokenizer.pad_token = fine_tuned_tokenizer.eos_token
+
+# You can use the `pipeline` abstraction for easy text generation
+generator = pipeline('text-generation', model=fine_tuned_model, tokenizer=fine_tuned_tokenizer)
+
+# 2. Generate text
+prompt = "The old castle stood on a hill, overlooking the valley. Inside,"
+
+# Key parameters for controlling text generation [1, 3, 4, 12]:
+# - max_length: The maximum length of the generated text (including the prompt) [1].
+# - num_return_sequences: The number of independent sequences to generate.
+# - temperature: Controls the randomness of the output. Higher values (e.g., 1.0) make it more random/creative,
+#                lower values (e.g., 0.7) make it more focused and deterministic [1, 3].
+# - top_k: Filters out low probability tokens, keeping only the top-k most likely ones [3].
+# - top_p: Uses nucleus sampling, selecting the smallest set of most probable tokens whose cumulative
+#          probability exceeds `top_p` [3].
+# - no_repeat_ngram_size: Avoids repetition of n-grams (e.g., set to 2 or 3 to avoid repeating pairs/triples of words).
+# - early_stopping: Stops generation when all beams have generated the EOS token.
+# - do_sample: If True, uses sampling; otherwise, uses greedy decoding.
+# - num_beams: For beam search decoding. Higher values lead to more coherent text but are slower.
+
+generated_texts = generator(
+    prompt,
+    max_length=200,
+    num_return_sequences=3,
+    temperature=0.7,
+    top_k=50,
+    top_p=0.95,
+    no_repeat_ngram_size=2,
+    repetition_penalty=1.2, # Penalizes tokens that have already appeared
+)
+
+for i, text in enumerate(generated_texts):
+    print(f"--- Generated Text {i+1} ---")
+    print(text['generated_text'])
+
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+# 1. Load your custom dataset
+# For demonstration, let's assume your data is in a text file named 'my_custom_data.txt'
+# For larger datasets, consider using the `load_dataset` function from the `datasets` library
+# which can handle various formats.
+# Example: If your data is line-by-line in a text file:
+# dataset = load_dataset('text', data_files={'train': 'my_custom_data.txt'})
+
+# Or, if loading a dataset from Hugging Face Hub (e.g., wikitext-2 for demonstration):
+dataset = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+
+# 2. Load the GPT-2 tokenizer
+tokenizer = AutoTokenizer.from_pretrained('gpt2')
+
+# Set the padding token to be the EOS token
+# This is crucial for GPT-2 as it doesn't have a default pad token [2]
+tokenizer.pad_token = tokenizer.eos_token
+
+# 3. Tokenize the dataset
+# A common practice for language modeling is to concatenate and chunk texts
+# to ensure consistent block sizes for training.
+
+def tokenize_function(examples):
+    # Ensure text is treated as a list of strings
+    return tokenizer(examples['text'], truncation=True, max_length=1024) # GPT-2 max input length is 1024 tokens [4]
+
+tokenized_datasets = dataset.map(tokenize_function, batched=True, remove_columns=["text"])
+
+# For language modeling, we often want to create chunks of a fixed size
+# and have the model predict the next token. The `labels` for this task
+# are simply the `input_ids` shifted by one.
+def group_texts(examples):
+    # Concatenate all texts.
+    concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
+    total_length = len(concatenated_examples[list(examples.keys())[0]])
+    # We drop the small remainder, we could add padding if the model supported it instead of this line.
+    # For now, we just truncate data to a multiple of block_size
+    block_size = 128 # Common block size, adjust based on your data and GPU memory
+    total_length = (total_length // block_size) * block_size
+    # Split by chunks of max_len.
+    result = {
+        k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+        for k, t in concatenated_examples.items()
+    }
+    result["labels"] = result["input_ids"].copy()
+    return result
+
+lm_datasets = tokenized_datasets.map(
+    group_texts,
+    batched=True,
+    batch_size=1000,
+    num_proc=4, # Use multiple processes for faster processing
+)
+
+# You might want to split your dataset into training and validation sets
+# For this example, we'll just use the loaded 'train' split as is.
+train_dataset = lm_datasets
+
+
+from transformers import GPT2LMHeadModel, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+import torch
+
+# 1. Load the pre-trained GPT-2 model with a language modeling head
+# 'GPT2LMHeadModel' is suitable for text generation [12]
+model = GPT2LMHeadModel.from_pretrained('gpt2')
+
+# 2. Define training arguments
+# These parameters control the training process [5, 7]
+training_args = TrainingArguments(
+    output_dir="./gpt2-fine-tuned",       # Output directory for model checkpoints and logs
+    overwrite_output_dir=True,            # Overwrite the content of the output directory
+    num_train_epochs=3,                   # Total number of training epochs
+    per_device_train_batch_size=8,        # Batch size per GPU/CPU for training
+    save_steps=10_000,                    # Save checkpoint every X updates steps
+    save_total_limit=2,                   # Limit the number of total checkpoints
+    logging_dir="./logs",                 # Directory for storing logs
+    logging_steps=500,                    # Log every X updates steps
+    evaluation_strategy="steps",          # Evaluate every `eval_steps`
+    eval_steps=10_000,                    # Number of update steps between two evaluations [5]
+    load_best_model_at_end=True,          # Load the best model at the end of training
+    metric_for_best_model="eval_loss",    # Metric to use to compare models
+    report_to="none",                     # Disable reporting to W&B, TensorBoard, etc.
+)
+
+# 3. Create a data collator
+# Data collators are objects that will form a batch by gathering all the elements
+# to be fed to the model. DataCollatorForLanguageModeling handles padding and creates labels.
+data_collator = DataCollatorForLanguageModeling(
+    tokenizer=tokenizer, mlm=False # mlm=False for causal language modeling (GPT-2's task)
+)
+
+# 4. Initialize the Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    # eval_dataset=eval_dataset, # Uncomment and define if you have a separate eval_dataset
+    data_collator=data_collator,
+)
+
+# 5. Train the model
+trainer.train()
+
+# 6. Save the fine-tuned model and tokenizer
+model_path = "./fine-tuned-gpt2-model"
+trainer.save_model(model_path)
+tokenizer.save_pretrained(model_path)
+    
+    print("\n")
