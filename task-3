@@ -1,0 +1,190 @@
+import random
+import re
+from collections import defaultdict
+
+class MarkovTextGenerator:
+    def __init__(self, order=1):
+        """
+        Initializes the MarkovTextGenerator.
+        Args:
+            order (int): The order of the Markov chain.
+                         1 means next word depends on current word (word -> next_word).
+                         N means next word depends on the N previous words (tuple of N words -> next_word).
+        """
+        if order < 1:
+            raise ValueError("Markov chain order must be at least 1.")
+        self.order = order
+        # For order 1: {current_word: {next_word: count, ...}}
+        # For order N: {(word1, word2, ..., wordN): {next_word: count, ...}}
+        self.model = defaultdict(lambda: defaultdict(int))
+        self.starts = [] # List of words that can start a sentence/generation
+
+    def train(self, text_corpus):
+        """
+        Trains the Markov model on the given text corpus.
+        Args:
+            text_corpus (str): The input text to train the model.
+        """
+        # Clean and tokenize the text
+        # Convert to lowercase, remove multiple spaces, add space around punctuation for better tokenization
+        cleaned_text = re.sub(r'([.?!,;:])', r' \1 ', text_corpus)
+        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+        words = cleaned_text.split()
+
+        if len(words) < self.order + 1:
+            print(f"Warning: Corpus too short for order {self.order}. Need at least {self.order + 1} words.")
+            return
+
+        # Identify potential starting words (words after .?!)
+        # Simplified: all words that start a sentence are considered potential starts.
+        # For a more robust solution, you might parse sentences explicitly.
+        sentence_enders = ['.', '?', '!']
+        for i, word in enumerate(words):
+            if i == 0 or (words[i-1] in sentence_enders and word not in sentence_enders):
+                self.starts.append(word)
+
+        # Build the Markov model
+        for i in range(len(words) - self.order):
+            current_state = tuple(words[i : i + self.order])
+            next_word = words[i + self.order]
+            self.model[current_state][next_word] += 1
+
+    def _get_next_word(self, current_state):
+        """
+        Randomly selects the next word based on the current state's probabilities.
+        """
+        possible_next_words_counts = self.model.get(current_state)
+        if not possible_next_words_counts:
+            return None # No transitions found for this state
+
+        # Create a list of words, where each word appears as many times as its count
+        # This allows random.choice to pick based on frequency
+        choices = []
+        for word, count in possible_next_words_counts.items():
+            choices.extend([word] * count)
+
+        return random.choice(choices)
+
+    def generate_text(self, length=50, start_word=None):
+        """
+        Generates text using the trained Markov model.
+        Args:
+            length (int): The maximum number of words to generate.
+            start_word (str, optional): The word to start the generation with.
+                                        If None, a random starting word from the corpus is chosen.
+        Returns:
+            str: The generated text.
+        """
+        if not self.model:
+            return "Model not trained. Please call .train() first."
+
+        if self.order == 1: # Handle 1st order start_word directly
+            if start_word and isinstance(start_word, str):
+                current_state_list = [start_word.lower()] # Ensure lowercase for consistency
+                if tuple(current_state_list) not in self.model:
+                    # If the provided start_word isn't found as a key, try a random one
+                    print(f"Warning: Start word '{start_word}' not found in model states. Picking a random start word.")
+                    current_state_list = [random.choice(self.starts)]
+            elif self.starts:
+                current_state_list = [random.choice(self.starts)]
+            else:
+                 # Fallback if no specific starts identified (e.g., very short corpus)
+                current_state_list = [random.choice(list(self.model.keys()))[0]] # Pick a random first word from a state key
+        else: # Handle Nth order start_word
+            if start_word and isinstance(start_word, (list, tuple)) and len(start_word) == self.order:
+                current_state_list = [w.lower() for w in start_word]
+                if tuple(current_state_list) not in self.model:
+                    print(f"Warning: Start phrase '{' '.join(start_word)}' not found in model states. Picking a random start phrase.")
+                    # Pick a random key from the model states
+                    current_state_list = list(random.choice(list(self.model.keys())))
+            elif self.model: # Default to a random start state from the trained model
+                current_state_list = list(random.choice(list(self.model.keys())))
+            else:
+                return "Could not determine a valid start state."
+
+
+        generated_words = list(current_state_list) # Initialize with the starting sequence
+
+        for _ in range(length - self.order):
+            current_state_tuple = tuple(current_state_list)
+            next_word = self._get_next_word(current_state_tuple)
+
+            if next_word is None:
+                # If no next word is found for the current state, try to find a new starting point
+                # This prevents the generation from stopping prematurely if it hits a dead end.
+                if self.starts:
+                    print(f"Dead end reached at '{' '.join(current_state_list)}'. Restarting from a random start word.")
+                    current_state_list = [random.choice(self.starts)] if self.order == 1 else list(random.choice(list(self.model.keys())))
+                    generated_words.append("...") # Indicate a restart
+                    continue # Try again with the new state
+                else:
+                    break # Cannot continue if no valid next word and no restart option
+
+            generated_words.append(next_word)
+            # Update current state by removing the first word and adding the new word
+            current_state_list = current_state_list[1:] + [next_word]
+
+        # Join the words and try to fix spacing around punctuation
+        generated_text = " ".join(generated_words)
+        generated_text = re.sub(r'\s+([.,!?;:])', r'\1', generated_text) # Remove space before punctuation
+        generated_text = generated_text[0].upper() + generated_text[1:] # Capitalize first letter
+        return generated_text
+
+# --- Example Usage ---
+if __name__ == "__main__":
+    # A sample corpus
+    sample_corpus = """
+    The quick brown fox jumps over the lazy dog. The dog barks loudly.
+    The quick brown cat naps on the mat. A red fox runs through the field.
+    A lazy dog loves to sleep. The field is green. What a wonderful day!
+    Dogs and cats are common pets. Pets are fun.
+    """
+
+    print("--- First Order Markov Chain (Word Level) ---")
+    markov1 = MarkovTextGenerator(order=1)
+    markov1.train(sample_corpus)
+
+    print("\nGenerated Text (random start):")
+    generated_text_1 = markov1.generate_text(length=30)
+    print(generated_text_1)
+
+    print("\nGenerated Text (starting with 'The'):")
+    generated_text_2 = markov1.generate_text(length=30, start_word="The")
+    print(generated_text_2)
+
+    print("\n--- Second Order Markov Chain (Word Level) ---")
+    # For a 2nd order chain, the model learns based on pairs of words
+    markov2 = MarkovTextGenerator(order=2)
+    markov2.train(sample_corpus)
+
+    print("\nGenerated Text (random start):")
+    generated_text_3 = markov2.generate_text(length=30)
+    print(generated_text_3)
+
+    print("\nGenerated Text (starting with 'The quick'):")
+    generated_text_4 = markov2.generate_text(length=30, start_word=["The", "quick"])
+    print(generated_text_4)
+
+    # --- Larger Corpus Example (Optional) ---
+    print("\n--- Example with a slightly larger corpus (Order 1) ---")
+    # You could load this from a file:
+    # with open("your_long_text_file.txt", "r", encoding="utf-8") as f:
+    #     longer_corpus = f.read()
+    longer_corpus = """
+    Alice was beginning to get very tired of sitting by her sister on the bank,
+    and of having nothing to do: once or twice she had peeped into the book her
+    sister was reading, but it had no pictures or conversations in it, "and what
+    is the use of a book," thought Alice "without pictures or conversation?"
+
+    So she was considering in her own mind (as well as she could, for the hot
+    day made her feel very sleepy and stupid), whether the pleasure of making a
+    daisy-chain would be worth the trouble of getting up and picking the daisies,
+    when suddenly a White Rabbit with pink eyes ran close by her.
+    """
+    markov_large = MarkovTextGenerator(order=1)
+    markov_large.train(longer_corpus)
+    print("\nGenerated Text (longer corpus, random start):")
+    print(markov_large.generate_text(length=70))
+
+    print("\nGenerated Text (longer corpus, start with 'Alice'):")
+    print(markov_large.generate_text(length=70, start_word="Alice"))
